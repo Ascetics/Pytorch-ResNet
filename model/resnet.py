@@ -2,402 +2,285 @@ import torch
 import torch.nn as nn
 
 
-class _ResNetFactory(nn.Module):
+def conv_3x3(in_channels, out_channels, stride=1):
     """
-    ResNet工厂类
+    3x3 same 卷积
+    :param in_channels: 输入通道
+    :param out_channels: 输出通道
+    :param stride: 下采样率。默认stride=1，不下采样；stride=2，下采样2倍
+    :return: 3x3 same 卷积
     """
+    return nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride,
+                     padding=1, bias=False)  # 后面接bn，bias=False;same卷积padding=1
 
-    def __init__(self, conv2_blocks, conv3_blocks, conv4_blocks, conv5_blocks,
-                 out_channels, in_channels=3, n_class=1000):
-        """
-        通过输入ResNet论文中Conv2_x,Conv3_x,Conv4_x,Conv5_x的blocks来确定是ResNet类型
-        连接全连接层要知道输入channel，也就是Residual Block最后输出的channel，也就是入参out_channels
-        :param conv2_blocks: 论文Conv2_x中的Residual Block，列表类型
-        :param conv3_blocks: 论文Conv3_x中的Residual Block，列表类型
-        :param conv4_blocks: 论文Conv4_x中的Residual Block，列表类型
-        :param conv5_blocks: 论文Conv5_x中的Residual Block，列表类型
-        :param out_channels: 对于ResNet18和ResNet34，out_channels=512
-                             对于ResNet50、ResNet101和ResNet152，out_channels=2048
-        :param in_channels: 输入图像通道，默认3
-        :param n_class: 分类数
-        """
-        super(_ResNetFactory, self).__init__()
 
-        # conv1 7x7
-        self.conv1 = nn.Conv2d(in_channels, 64, 7, stride=2, padding=3,
-                               bias=False)
-        self.bn = nn.BatchNorm2d(64)
+def conv_1x1(in_channels, out_channels, stride=1):
+    """
+    用于调整维度
+    layer调整channel
+    project调整channel，spatial
+    :param in_channels: 输入通道
+    :param out_channels: 输出通道
+    :param stride: 下采样率。默认stride=1，不下采样；stride=2，下采样2倍
+    :return: 1x1 卷积
+    """
+    return nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride,
+                     bias=False)  # 后面接bn，bias=False
+
+
+class BasicBlock(nn.Module):
+    expansion = 1  # Basic Block 最后一个卷积输出channels是plane的1倍
+
+    def __init__(self, inplanes, planes, stride=1, batch_norm=None,
+                 project=None):
+        """
+        Basic Block 每个block有2个3x3卷积，两个卷积的输出通道数相同，等于planes。
+        :param inplanes: 这个basic block的输入通道数，前一个basic block输出通道数。
+        :param planes: 两个卷积的输出通道数相同，等于planes。取值64,128,256,512。
+        :param stride: stride=1，不下采样；
+                       stride=2，第一个卷积下采样；
+        :param batch_norm: 外部指定bn，不指定就用默认bn。
+        :param project: 外部指定project也就是残差中的+x方法。
+        """
+        super(BasicBlock, self).__init__()
+        if batch_norm is None:
+            batch_norm = nn.BatchNorm2d  # 外部不指定bn就使用默认bn
+
+        # 第一个3x3卷积，论文中conv2_x不下采样，conv3_x-conv5_x下采样
+        self.conv1 = conv_3x3(inplanes, planes, stride=stride)
+        self.bn1 = batch_norm(planes)
         self.relu = nn.ReLU(inplace=True)
-        self.maxpool = nn.MaxPool2d(3, stride=2, ceil_mode=True)
 
-        # conv2-conv5
-        self.conv2 = nn.Sequential(*conv2_blocks)
-        self.conv3 = nn.Sequential(*conv3_blocks)
-        self.conv4 = nn.Sequential(*conv4_blocks)
-        self.conv5 = nn.Sequential(*conv5_blocks)
+        # 第二个3x3卷积，都不下采样
+        self.conv2 = conv_3x3(planes, planes)
+        self.bn2 = batch_norm(planes)
 
-        # avgpool
-        self.avgpool = nn.AdaptiveAvgPool2d(1)
-
-        # fc
-        self.fc = nn.Linear(out_channels, n_class)
+        # 维数一致才能相加， +x 或者 +project(x)
+        self.project = project
         pass
 
     def forward(self, x):
+        identity = x  # 记录下输入x
+
+        # 第一个卷积
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        # 第二个卷积
+        out = self.conv2(out)
+        out = self.bn2(out)
+
+        # 维数一致才能相加
+        # 判断+identity，还是+project(x)
+        if self.project is not None:
+            identity = self.project(x)
+        out += identity  # 残差+
+        out = self.relu(out)  # 加上以后再relu
+        return out
+
+    pass
+
+
+class Bottleneck(nn.Module):
+    expansion = 4  # Bottleneck最后一个卷积输出channels是planes的4倍
+
+    def __init__(self, inplanes, planes, stride=1, batch_norm=None,
+                 project=None):
+        """
+        Bottleneck
+        每个block有3个卷积：1x1降低channel；3x3卷积下采样或不下采样；1x1升高channels；减小计算量。
+        前两个卷积的输出channels相同，都等于planes
+        最后一个卷积的输出channels是planes的4倍
+        :param inplanes: 这个basic block的输入通道数，前一个basic block输出通道数。
+        :param planes: 前两个卷积的输出通道数相同，等于planes。取值64,128,256,512。
+        :param stride: stride=1，不下采样；
+                       stride=2，第一个卷积下采样；
+        :param batch_norm: 外部指定bn，不指定就用默认bn。
+        :param project: 外部指定project也就是残差中的+x方法。
+        """
+        super(Bottleneck, self).__init__()
+        if batch_norm is None:
+            batch_norm = nn.BatchNorm2d  # 外部不指定bn就使用默认bn
+
+        # 第一个1x1卷积，降低channels
+        self.conv1 = conv_1x1(inplanes, planes)
+        self.bn1 = batch_norm(planes)
+        self.relu = nn.ReLU(inplace=True)
+
+        # 第二个3x3卷积，下采样或不下采样
+        self.conv2 = conv_3x3(planes, planes, stride=stride)
+        self.bn2 = batch_norm(planes)
+
+        # 第三个1x1卷积，升高channels到planes的4倍
+        self.conv3 = conv_1x1(planes, self.expansion * planes)
+        self.bn3 = batch_norm(self.expansion * planes)
+
+        # 维数一致才能相加，+x 或者 +project(x)
+        self.project = project
+        pass
+
+    def forward(self, x):
+        identity = x  # 记录下输入x
+
+        # 第一个1x1卷积，降低channels
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        # 第二个3x3卷积，下采样或不下采样
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out = self.relu(out)
+
+        # 第三个1x1卷积，升高channels到planes的4倍
+        out = self.conv3(out)
+        out = self.bn3(out)
+
+        # 维数一致才能相加
+        # +x 或者 +project(x)
+        if self.project is not None:
+            identity = self.project(x)
+        out += identity  # 残差+
+        out = self.relu(out)  # 加上以后再relu
+        return out
+
+    pass
+
+
+class ResNet(nn.Module):
+    def __init__(self, block, layers, in_channels=3, n_class=1000,
+                 batch_norm=None):
+        """
+        ResNet 18/34/50/101/152
+        :param blcok: ResNet 18/34 用Basic Block
+                      ResNet 50/101/152 用Bottleneck
+        :param layers: 每种ResNet各个layer中block的数量。
+                       取列表前4个数字，依次代表论文Conv2_x至Conv5_x中block的数量
+        :param in_channels: 模型输入默认是3通道的
+        :param n_class: 默认1000种分类
+        :param batch_norm: 外部指定bn
+        """
+        super(ResNet, self).__init__()
+        if batch_norm is None:
+            batch_norm = nn.BatchNorm2d  # 没有外部指定bn就用默认bn
+        self._batch_norm = batch_norm
+
+        self.inplanes = 64  # 各个layer输出通道数，conv1输出64通道，后面再make_layer中更新
+
+        # 论文Conv1，same卷积，卷积核大小7，下采样到out_stride=2
+        self.conv1 = nn.Conv2d(in_channels, self.inplanes, kernel_size=7,
+                               stride=2, padding=3, bias=False)  # 后面接bn不要bias
+        self.bn1 = self._batch_norm(self.inplanes)
+        self.relu1 = nn.ReLU(inplace=True)
+
+        # 论文maxpool，核大小3x3，下采样到out_stride=4。是论文Conv2_x的一部分
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+
+        # 论文Conv2_x，不下采样
+        self.layer1 = self._make_layer(block, layers[0], 64)
+
+        # 论文Conv3_x，下采样到out_stride=8
+        self.layer2 = self._make_layer(block, layers[1], 128, stride=2)
+
+        # 论文Conv4_x，下采样out_stride=16
+        self.layer3 = self._make_layer(block, layers[2], 256, stride=2)
+
+        # 论文Conv5_x，下采样out_stride=32
+        self.layer4 = self._make_layer(block, layers[3], 512, stride=2)
+
+        self.avgpool = nn.AdaptiveAvgPool2d(1)  # 全局平均池化
+        self.fc = nn.Linear(self.inplanes, n_class)  # 全连接层
+        pass
+
+    def _make_layer(self, block, n_block, planes, stride=1):
+        """
+        构造layer1-layer4，也就是论文中的Conv2_x-Conv5_x
+        :param block: ResNet 18/34 用Basic Block
+                      ResNet 50/101/152 用Bottleneck
+        :param n_block: 本层block数量
+        :param inplanes: 本层输入channels数，上一层输出channels数
+        :param planes: 本层的基准channels数
+        :param stride: stride=1，不下采样；
+                       stride=2，第一个卷积下采样；
+        :return:
+        """
+        batch_norm = self._batch_norm
+
+        # 第一个block考虑设置project
+        project = None
+        if stride != 1 or self.inplanes != block.expansion * planes:
+            # stride!=1 下采样，调整spatial
+            # block输入channels和输出channels不一致，调整channels=block.expansion * planes
+            project = nn.Sequential(
+                conv_1x1(self.inplanes, block.expansion * planes,
+                         stride=stride),
+                batch_norm(block.expansion * planes)  # 调整维数后bn
+            )
+
+        # 第一个block考虑是否下采样，单独设置
+        layer = [block(self.inplanes, planes, stride=stride,
+                       batch_norm=batch_norm, project=project)]
+
+        self.inplanes = block.expansion * planes  # 后面几个block输入channel
+
+        # 其余block一样，都不进行下采样，循环添加
+        for _ in range(1, n_block):  # 第一个block单独设置了，所以range从1开始
+            layer.append(block(self.inplanes, planes, batch_norm=batch_norm))
+            pass
+
+        return nn.Sequential(*layer)
+
+    def forward(self, x):
         x = self.conv1(x)  # 1/2
-        x = self.bn(x)
+        x = self.bn1(x)
+        x = self.relu1(x)
+
         x = self.maxpool(x)  # 1/4
-        x = self.conv2(x)
-        x = self.conv3(x)  # 1/8
-        x = self.conv4(x)  # 1/16
-        x = self.conv5(x)  # 1/32
-        x = self.avgpool(x)  # 输出是4维张量
-        x = x.view(1, -1)  # 变成1维向量
+        x = self.layer1(x)
+
+        x = self.layer2(x)  # 1/8
+        x = self.layer3(x)  # 1/16
+        x = self.layer4(x)  # 1/32
+
+        x = self.avgpool(x)  # 输出1xCx1x1张量
+        x = x.view(1, -1)  # 拉成1维向量
+
         x = self.fc(x)
         return x
 
     pass
 
 
-################################################################################
+def resnet18(in_channels=3, n_class=1000, batch_norm=None):
+    return ResNet(BasicBlock, [2, 2, 2, 2], in_channels=in_channels,
+                  n_class=n_class, batch_norm=batch_norm)
 
-class _BasicBlockDown(nn.Module):
-    """
-    Basic Block中的一种
 
-    第一个卷积Downsample
-    spatial减小一倍，stride=2
-    channel增大一倍，out_channels = 2*in_channels
+def resnet34(in_channels=3, n_class=1000, batch_norm=None):
+    return ResNet(BasicBlock, [3, 4, 6, 3], in_channels=in_channels,
+                  n_class=n_class, batch_norm=batch_norm)
 
-    加shortcut需要1x1卷积调整维度
-    因第一个卷积spatial减小一倍，1x1卷积的stride=2
 
-    第二个卷积
-    spatial不变
-    channel不变
-    """
+def resnet50(in_channels=3, n_class=1000, batch_norm=None):
+    return ResNet(Bottleneck, [3, 4, 6, 3], in_channels=in_channels,
+                  n_class=n_class, batch_norm=batch_norm)
 
-    def __init__(self, in_channels, out_channels):
-        super(_BasicBlockDown, self).__init__()
-        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, stride=2,
-                               padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(out_channels)
-        self.relu1 = nn.ReLU(inplace=True)
-        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1,
-                               bias=False)
-        self.bn2 = nn.BatchNorm2d(out_channels)
 
-        # 调整shortcut的channel
-        # 调整shortcut的spatial，stride=2
-        self.project = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, 1, stride=2, bias=False),
-            nn.BatchNorm2d(out_channels)
-        )
-        self.relu2 = nn.ReLU(inplace=True)
+def resnet101(in_channels=3, n_class=1000, batch_norm=None):
+    return ResNet(Bottleneck, [3, 4, 23, 3], in_channels=in_channels,
+                  n_class=n_class, batch_norm=batch_norm)
 
-        pass
 
-    def forward(self, x):
-        f = x
-        f = self.conv1(f)
-        f = self.bn1(f)
-        f = self.relu1(f)
-        f = self.conv2(f)
-        f = self.bn2(f)
-        f += self.project(x)  # 调整维度才能相加
-        f = self.relu2(f)
-        return f
-
-    pass
-
-
-class _BasicBlockSame(nn.Module):
-    """
-    Basic Block中的一种
-
-    第一个卷积spatial、channel都不变
-    加shortcut不需要1x1卷积
-    第二个卷积spatial、channel都不变
-    """
-
-    def __init__(self, in_channels, out_channels):
-        super(_BasicBlockSame, self).__init__()
-        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=1,
-                               bias=False)
-        self.bn1 = nn.BatchNorm2d(in_channels)
-        self.relu1 = nn.ReLU(inplace=True)
-        self.conv2 = nn.Conv2d(in_channels, out_channels, 3, padding=1,
-                               bias=False)
-        self.bn2 = nn.BatchNorm2d(out_channels)
-        self.relu2 = nn.ReLU(inplace=True)
-        pass
-
-    def forward(self, x):
-        f = x
-        f = self.conv1(f)
-        f = self.bn1(f)
-        f = self.relu1(f)
-        f = self.conv2(f)
-        f = self.bn2(f)
-        f += x
-        f = self.relu2(f)
-        return f
-
-    pass
-
-
-def resnet18():
-    """
-    按照论文实现ResNet18
-    :return: ResNet18
-    """
-    # conv2不做Downsample
-    conv2 = [_BasicBlockSame(64, 64), _BasicBlockSame(64, 64)]
-
-    # conv3-conv5第一个block做Downsample
-    conv3 = [_BasicBlockDown(64, 128), _BasicBlockSame(128, 128)]
-
-    conv4 = [_BasicBlockDown(128, 256), _BasicBlockSame(256, 256)]
-
-    conv5 = [_BasicBlockDown(256, 512), _BasicBlockSame(512, 512)]
-
-    return _ResNetFactory(conv2, conv3, conv4, conv5, 512)
-
-
-def resnet34():
-    """
-    按照论文实现ResNet34
-    :return: ResNet34
-    """
-    # conv2不做Downsample
-    conv2 = [_BasicBlockSame(64, 64), _BasicBlockSame(64, 64),
-             _BasicBlockSame(64, 64)]
-
-    # conv3-conv5第一个block做Downsample
-    conv3 = [_BasicBlockDown(64, 128), _BasicBlockSame(128, 128),
-             _BasicBlockSame(128, 128), _BasicBlockSame(128, 128)]
-
-    conv4 = [_BasicBlockDown(128, 256), _BasicBlockSame(256, 256),
-             _BasicBlockSame(256, 256), _BasicBlockSame(256, 256),
-             _BasicBlockSame(256, 256), _BasicBlockSame(256, 256)]
-
-    conv5 = [_BasicBlockDown(256, 512), _BasicBlockSame(512, 512),
-             _BasicBlockSame(512, 512), _BasicBlockSame(512, 512),
-             _BasicBlockSame(512, 512), _BasicBlockSame(512, 512)]
-
-    return _ResNetFactory(conv2, conv3, conv4, conv5, 512)
-
-
-################################################################################
-
-class _BottleneckBlockForConv2(nn.Module):
-    """
-    Bottleneck Block的一种，用于Conv2，不做Downsample
-    """
-
-    def __init__(self, in_channels=64, out_channels=256):
-        super(_BottleneckBlockForConv2, self).__init__()
-        self.conv1 = nn.Conv2d(in_channels, in_channels, 1,
-                               bias=False)  # 第一个卷积不改channel
-        self.bn1 = nn.BatchNorm2d(in_channels)
-        self.relu1 = nn.ReLU(inplace=True)
-
-        self.conv2 = nn.Conv2d(in_channels, in_channels, 3, padding=1,
-                               bias=False)  # 第二个卷积不做Downsample
-        self.bn2 = nn.BatchNorm2d(in_channels)
-        self.relu2 = nn.ReLU(inplace=True)
-
-        self.conv3 = nn.Conv2d(in_channels, out_channels, 1, bias=False)
-        self.bn3 = nn.BatchNorm2d(out_channels)
-        # 调整维度
-        self.project = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, 1, bias=False),
-            nn.BatchNorm2d(out_channels)
-        )
-        self.relu3 = nn.ReLU(inplace=True)
-
-        pass
-
-    def forward(self, x):
-        f = x
-        f = self.conv1(f)
-        f = self.bn1(f)
-        f = self.relu1(f)
-        f = self.conv2(f)
-        f = self.bn2(f)
-        f = self.relu2(f)
-        f = self.conv3(f)
-        f = self.bn3(f)
-        f += self.project(x)
-        f = self.relu3(f)
-        return f
-
-    pass
-
-
-class _BottleneckBlockDown(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super(_BottleneckBlockDown, self).__init__()
-        mid_channels = in_channels // 2
-        self.conv1 = nn.Conv2d(in_channels, mid_channels, 1, bias=False)
-        self.bn1 = nn.BatchNorm2d(mid_channels)
-        self.relu1 = nn.ReLU(inplace=True)
-
-        self.conv2 = nn.Conv2d(mid_channels, mid_channels, 3, stride=2,
-                               padding=1, bias=False)  # 做Downsample
-        self.bn2 = nn.BatchNorm2d(mid_channels)
-        self.relu2 = nn.ReLU(inplace=True)
-
-        self.conv3 = nn.Conv2d(mid_channels, out_channels, 1, bias=False)
-        self.bn3 = nn.BatchNorm2d(out_channels)
-        # 调整维度
-        self.project = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, 1, stride=2, bias=False),
-            nn.BatchNorm2d(out_channels)
-        )
-        self.relu3 = nn.ReLU(inplace=True)
-
-        pass
-
-    def forward(self, x):
-        f = x
-        f = self.conv1(f)
-        f = self.bn1(f)
-        f = self.relu1(f)
-        f = self.conv2(f)
-        f = self.bn2(f)
-        f = self.relu2(f)
-        f = self.conv3(f)
-        f = self.bn3(f)
-        f += self.project(x)
-        f = self.relu3(f)
-        return f
-
-    pass
-
-
-class _BottleneckBlockSame(nn.Module):
-    """
-    Bottleneck Block的一种，每个Conv层里面不做Downsample，重复的block
-    """
-
-    def __init__(self, in_channels, out_channel):
-        super(_BottleneckBlockSame, self).__init__()
-        mid_channels = in_channels // 4
-        self.conv1 = nn.Conv2d(in_channels, mid_channels, 1, bias=False)
-        self.bn1 = nn.BatchNorm2d(mid_channels)
-        self.relu1 = nn.ReLU(inplace=True)
-
-        self.conv2 = nn.Conv2d(mid_channels, mid_channels, 3, padding=1,
-                               bias=False)
-        self.bn2 = nn.BatchNorm2d(mid_channels)
-        self.relu2 = nn.ReLU(inplace=True)
-
-        self.conv3 = nn.Conv2d(mid_channels, out_channel, 1, bias=False)
-        self.bn3 = nn.BatchNorm2d(out_channel)
-        self.relu3 = nn.ReLU(inplace=True)
-        pass
-
-    def forward(self, x):
-        f = x
-        f = self.conv1(f)
-        f = self.bn1(f)
-        f = self.relu1(f)
-        f = self.conv2(f)
-        f = self.bn2(f)
-        f = self.relu2(f)
-        f = self.conv3(f)
-        f = self.bn3(f)
-        f += x
-        f = self.relu3(f)
-        return f
-
-    pass
-
-
-def resnet50():
-    """
-    按照论文实现ResNet50
-    :return: ResNet50
-    """
-    conv2 = [_BottleneckBlockForConv2(64, 256)]
-    for i in range(2):
-        conv2.append(_BottleneckBlockSame(256, 256))
-
-    conv3 = [_BottleneckBlockDown(256, 512)]
-    for i in range(3):
-        conv3.append(_BottleneckBlockSame(512, 512))
-
-    conv4 = [_BottleneckBlockDown(512, 1024)]
-    for i in range(5):
-        conv4.append(_BottleneckBlockSame(1024, 1024))
-
-    conv5 = [_BottleneckBlockDown(1024, 2048)]
-    for i in range(2):
-        conv5.append(_BottleneckBlockSame(2048, 2048))
-
-    return _ResNetFactory(conv2, conv3, conv4, conv5, 2048)
-
-
-def resnet101():
-    """
-    按照论文实现ResNet101
-    :return: ResNet101
-    """
-    conv2 = [_BottleneckBlockForConv2(64, 256)]
-    for i in range(2):
-        conv2.append(_BottleneckBlockSame(256, 256))
-
-    conv3 = [_BottleneckBlockDown(256, 512)]
-    for i in range(3):
-        conv3.append(_BottleneckBlockSame(512, 512))
-
-    conv4 = [_BottleneckBlockDown(512, 1024)]
-    for i in range(22):
-        conv4.append(_BottleneckBlockSame(1024, 1024))
-
-    conv5 = [_BottleneckBlockDown(1024, 2048)]
-    for i in range(2):
-        conv5.append(_BottleneckBlockSame(2048, 2048))
-
-    return _ResNetFactory(conv2, conv3, conv4, conv5, 2048)
-
-
-def resnet152():
-    """
-    按照论文实现ResNet152
-    :return: ResNet152
-    """
-    conv2 = [_BottleneckBlockForConv2(64, 256)]
-    for i in range(2):
-        conv2.append(_BottleneckBlockSame(256, 256))
-
-    conv3 = [_BottleneckBlockDown(256, 512)]
-    for i in range(7):
-        conv3.append(_BottleneckBlockSame(512, 512))
-
-    conv4 = [_BottleneckBlockDown(512, 1024)]
-    for i in range(35):
-        conv4.append(_BottleneckBlockSame(1024, 1024))
-
-    conv5 = [_BottleneckBlockDown(1024, 2048)]
-    for i in range(2):
-        conv5.append(_BottleneckBlockSame(2048, 2048))
-
-    return _ResNetFactory(conv2, conv3, conv4, conv5, 2048)
-
-
-################################################################################
+def resnet152(in_channels=3, n_class=1000, batch_norm=None):
+    return ResNet(Bottleneck, [3, 8, 36, 3], in_channels=in_channels,
+                  n_class=n_class, batch_norm=batch_norm)
 
 
 if __name__ == '__main__':
-    in_data = torch.randint(0, 256, (1, 3, 224, 224), dtype=torch.float32)
-    print('in_data', in_data.shape)
-
-    net = resnet18()
+    # net = resnet18()
     # net = resnet34()
-    # net = resnet50()
-    # net = resnet50()
+    net = resnet50()
     # net = resnet101()
     # net = resnet152()
-    out_data = net(in_data)
+    print(net)
