@@ -278,9 +278,9 @@ def resnet152(in_channels=3, n_class=1000, batch_norm=None):
 
 
 if __name__ == '__main__':
-    # net = resnet18()
+    net = resnet18()
     # net = resnet34()
-    net = resnet50()
+    # net = resnet50()
     # net = resnet101()
     # net = resnet152()
     print(net)
