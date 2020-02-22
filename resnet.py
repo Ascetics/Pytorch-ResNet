@@ -244,7 +244,7 @@ class ResNet(nn.Module):
         x = self.layer4(x)  # 1/32
 
         x = self.avgpool(x)  # 输出1xCx1x1张量
-        x = x.view(1, -1)  # 拉成1维向量
+        x = x.view(x.size(0), -1)  # 拉成1维向量
 
         x = self.fc(x)
         return x
