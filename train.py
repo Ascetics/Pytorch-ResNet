@@ -38,21 +38,20 @@ def epoch_timer(func):
     :return:
     """
 
-    def timer(*args, **kwargs):
-        begin_time = datetime.now()
-        func(*args, **kwargs)
-        end_time = datetime.now()
-        mm, ss = divmod((end_time - begin_time).seconds, 60)
-        hh, mm = divmod(mm, 60)
-        print('Time: {:02d}:{:02d}:{:02d}'.format(hh, mm, ss))
-        pass
+    def timer(*args, **kwargs):  # func的所有入参
+        begin_time = datetime.now()  # 开始时间
+        res = func(*args, **kwargs)  # 执行func，记录func返回值
+        end_time = datetime.now()  # 结束时间
+        mm, ss = divmod((end_time - begin_time).seconds, 60)  # 秒换算成分、秒
+        hh, mm = divmod(mm, 60)  # 分钟换算成时、分
+        print('Time: {:02d}:{:02d}:{:02d}'.format(hh, mm, ss))  # HH:mm:ss
+        return res  # 返回func返回值
 
     return timer
 
 
 @epoch_timer  # 记录一个epoch时间并打印
-def epoch_train(net, loss_func, optimizer, train_data, valid_data,
-                device=torch.device('cpu')):
+def epoch_train(net, loss_func, optimizer, train_data, valid_data):
     """
     一个epoch训练过程，分成两个阶段：先训练，再验证
     :param net: 使用的模型
@@ -60,9 +59,12 @@ def epoch_train(net, loss_func, optimizer, train_data, valid_data,
     :param optimizer: 优化器
     :param train_data: 训练集
     :param valid_data: 验证集
-    :param device: 指定使用的设备，默认cpu
     :return: 一个epoch的训练loss、训练acc、验证loss、验证acc
     """
+    device = torch.device('cuda:5' if torch.cuda.is_available() else 'cpu')  # 使用GPU，没有GPU就用CPU
+    net.to(device)  # 模型装入GPU
+    loss_func.to(device)  # loss函数装入CPU
+
     """训练"""
     train_loss, train_acc = 0., 0.  # 一个epoch训练的loss和正确率acc
     net.train()  # 训练
@@ -128,9 +130,6 @@ def train(net, loss_func, optimizer, train_data, valid_data, name, epochs=5):
     :param epochs: epoch数，默认是5
     :return:
     """
-    device = torch.device('cuda:5' if torch.cuda.is_available() else 'cpu')  # 使用GPU，没有GPU就用CPU
-    net.to(device)  # 模型装入GPU
-    loss_func.to(device)  # loss函数装入CPU
     for e in range(epochs):
         t_loss, t_acc, v_loss, v_acc = epoch_train(net, loss_func, optimizer,
                                                    train_data, valid_data)  # 一个epoch训练
@@ -138,7 +137,7 @@ def train(net, loss_func, optimizer, train_data, valid_data, name, epochs=5):
                      'Train Loss: {:.4f} | Train Acc: {:.4f} | '
                      'Valid Loss: {:.4f} | Valid Acc: {:.4f}')
         print(epoch_str.format(e + 1, t_loss, t_acc, v_loss, v_acc))  # 打印一个epoch的loss和acc
-        save_checkpoint(net, name, e)
+        save_checkpoint(net, name, e)  # 每个epoch的参数都保存
         pass
     pass
 
@@ -191,6 +190,7 @@ if __name__ == '__main__':
                                        sampler=v_sampler)
 
     resnet_model = resnet.resnet18(n_class=10)  # resnet模型，cifar10分类10种
+    print(resnet_model)
     resnet_model_loss_func = nn.CrossEntropyLoss()  # loss函数
     resnet_model_optimizer = torch.optim.Adam(resnet_model.parameters())  # 将模型参数装入优化器
 
